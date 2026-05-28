@@ -27,7 +27,7 @@ jobs:
         run: |
           cd scanner
           python backtest_perp_scanner.py --mode dashboard --limit 100
-        continue-on-error: true
+        # continue-on-error: true
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v3
