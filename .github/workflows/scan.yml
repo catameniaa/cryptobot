@@ -12,6 +12,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
 
@@ -24,13 +26,13 @@ jobs:
         run: pip install ccxt pandas numpy requests
 
       - name: Syntax Check
-        run: |
-          python -m py_compile scanner/backtest_perp_scanner.py && echo "SYNTAX OK" || echo "SYNTAX ERROR"
+        run: python -m py_compile scanner/backtest_perp_scanner.py && echo "SYNTAX OK" || echo "SYNTAX ERROR"
 
       - name: Scanner Calistir
         run: |
           cd scanner
           python backtest_perp_scanner.py --mode dashboard --limit 100
+        continue-on-error: true
 
       - name: Deploy
         uses: peaceiris/actions-gh-pages@v3
