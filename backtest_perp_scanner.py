@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import time, sys, argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
 try:
     import ccxt, numpy as np, pandas as pd
 except ImportError:
@@ -236,7 +237,7 @@ def write_html(sl, ss, rl, rs, hv, regime, ts):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta http-equiv="refresh" content="900">
+<meta http-equiv="refresh" content="300">
 <title>Crypto Dashboard</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -270,14 +271,16 @@ tr:hover td{{background:#1c2128}}
 <div class="kpi"><div class="l">BTC</div><div class="v">{bp}</div></div>
 <div class="kpi"><div class="l">EMA200</div><div class="v">{ep}</div></div>
 <div class="kpi"><div class="l">Rejim</div><div class="v {rcls}">{rlbl}</div></div>
-<div class="kpi"><div class="l">Guncelleme</div><div class="v" style="font-size:.72em">{ts}</div></div>
+<div class="kpi"><div class="l">Son Güncelleme</div><div class="v" style="font-size:.75em">{ts}</div></div>
 </div>
-<button class="btn" onclick="location.reload()">Sayfayi Yenile</button>
-<div class="warn">UYARI: Karar destek aracidir, trade botu degildir. Paper trade tutun, 30+ ornek sonrasi hit-rate olcun.</div>
-<h2>Guclu Long (net &gt;= {STRONG})</h2>
+<button class="btn" onclick="window.location.href = window.location.pathname + '?v=' + new Date().getTime();">
+    Sayfayı Yenile (Son Veriyi Çek)
+</button>
+<div class="warn">UYARI: Karar destek aracıdır, trade botu değildir. Paper trade tutun, 30+ örnek sonrası hit-rate ölçün.</div>
+<h2>Güçlü Long (net &gt;= {STRONG})</h2>
 <table><tr><th>Sembol</th><th>Fiyat</th><th>RSI</th><th>Ham</th><th>Net</th><th>Fund</th><th>OI</th><th>Sinyaller</th></tr>
 {trows(sl)}</table>
-<h2>Guclu Short (net &lt;= -{STRONG})</h2>
+<h2>Güçlü Short (net &lt;= -{STRONG})</h2>
 <table><tr><th>Sembol</th><th>Fiyat</th><th>RSI</th><th>Ham</th><th>Net</th><th>Fund</th><th>OI</th><th>Sinyaller</th></tr>
 {trows(ss)}</table>
 <h2>Ham Long</h2>
@@ -287,9 +290,9 @@ tr:hover td{{background:#1c2128}}
 <table><tr><th>Sembol</th><th>Fiyat</th><th>RSI</th><th>Ham</th><th>Net</th><th>Fund</th><th>OI</th><th>Sinyaller</th></tr>
 {trows(rs)}</table>
 <h2>Funding Harvest</h2>
-<table><tr><th>Sembol</th><th>Yillik Ort.</th><th>Std</th><th>Pozitif%</th><th>Skor</th></tr>
+<table><tr><th>Sembol</th><th>Yıllık Ort.</th><th>Std</th><th>Pozitif%</th><th>Skor</th></tr>
 {hrows(hv)}</table>
-<p style="color:var(--muted);font-size:.7em;text-align:center;margin-top:12px">15 dk otomatik guncellenir | {ts}</p>
+<p style="color:var(--muted);font-size:.7em;text-align:center;margin-top:12px">5 dk otomatik güncellenir | {ts}</p>
 </body></html>"""
 
     (OUT / "index.html").write_text(html, encoding='utf-8')
@@ -352,7 +355,13 @@ def main():
     hv.sort(key=lambda x: -x['score'])
     hv = hv[:15]
 
-    ts = datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+    # UTC ve TSİ (Türkiye Saati - UTC+3) Hesaplama
+    now_utc = datetime.now(timezone.utc)
+    tr_tz = timezone(timedelta(hours=3))
+    now_tr = now_utc.astimezone(tr_tz)
+    
+    ts = f"{now_utc.strftime('%H:%M')} UTC | {now_tr.strftime('%H:%M')} TSİ"
+    
     write_html(sl, ss, rl, rs, hv, regime, ts)
     print(f"=== TAMAM | Long:{len(sl)} Short:{len(ss)} Harvest:{len(hv)} ===")
 
