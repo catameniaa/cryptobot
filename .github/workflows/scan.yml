@@ -22,7 +22,15 @@ jobs:
 
       - name: Bagimlilik Yukle
         run: pip install ccxt pandas numpy requests
-
+      - name: Syntax Check
+        run: |
+          python -m py_compile scanner/backtest_perp_scanner.py && echo "SYNTAX OK" || echo "SYNTAX ERROR"
+          python -c "
+          import subprocess, sys
+          result = subprocess.run(['python', 'scanner/backtest_perp_scanner.py', '--help'], capture_output=True, text=True)
+          print('STDOUT:', result.stdout)
+          print('STDERR:', result.stderr)
+          "
       - name: Scanner Calistir
         run: |
           cd scanner
