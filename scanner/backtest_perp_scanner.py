@@ -11,8 +11,6 @@ OUT = Path(__file__).parent
 STRONG = 2
 DAMPEN = 0.5
 
-# ── Teknik Indikatörler ──────────────────────────────────────────────────────
-
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
@@ -62,15 +60,11 @@ def divergence(close, rsi_s, lb=14):
         return -1
     return 0
 
-# ── Exchange ─────────────────────────────────────────────────────────────────
-
 def get_ex():
     return ccxt.okx({
         'options': {'defaultType': 'swap'},
         'enableRateLimit': True
     })
-
-# ── Veri Çekme (tamamı CCXT, hardcoded URL yok) ──────────────────────────────
 
 def fetch_ohlcv(ex, sym, tf='4h', lim=300):
     try:
@@ -85,18 +79,16 @@ def fetch_ohlcv(ex, sym, tf='4h', lim=300):
         return None
 
 def fetch_funding(ex, sym):
-    """Güncel funding rate → yıllık % olarak döner."""
     try:
         data = ex.fetch_funding_rate(sym)
         rate = data.get('fundingRate')
         if rate is None:
             return None
-        return float(rate) * 100 * 3 * 365  # 8h ödeme × 3 × 365
+        return float(rate) * 100 * 3 * 365
     except:
         return None
 
 def fetch_oi(ex, sym):
-    """OI değişimi (son 24 bar, 1h) → % olarak döner."""
     try:
         history = ex.fetch_open_interest_history(sym, '1h', limit=25)
         if not history or len(history) < 2:
@@ -107,16 +99,8 @@ def fetch_oi(ex, sym):
     except:
         return None
 
-def fetch_cvd(ex, sym, lim=100):
-    """
-    CVD: taker buy volume - taker sell volume kümülatif toplamı.
-    OKX mark candles taker buy'ı ayrıştırmaz; CCXT trades üzerinden
-    hesaplamak rate-limit açısından ağır. En güvenli yol: None döndür,
-    sinyal 0 sayılır. Diğer 6 sinyal sağlıklı çalışır.
-    """
+def fetch_cvd(ex, sym):
     return None
-
-# ── BTC Rejimi ────────────────────────────────────────────────────────────────
 
 def btc_regime(ex):
     df = fetch_ohlcv(ex, 'BTC/USDT:USDT', '1d', 220)
@@ -126,27 +110,25 @@ def btc_regime(ex):
     p = df['close'].iloc[-1]
     return {'bull': p > e.iloc[-1], 'price': p, 'ema200': e.iloc[-1]}
 
-# ── Coin Tarama ───────────────────────────────────────────────────────────────
-
 def scan_coin(ex, sym, bull):
     df = fetch_ohlcv(ex, sym)
     if df is None:
         return None
 
-    close  = df['close']
-    r14    = rsi(close)
+    close = df['close']
+    r14 = rsi(close)
     bb_lo, bb_hi = bollinger(close)
-    st     = supertrend(df)
-    fund   = fetch_funding(ex, sym)
-    oi     = fetch_oi(ex, sym)
-    cvd    = fetch_cvd(ex, sym)
+    st = supertrend(df)
+    fund = fetch_funding(ex, sym)
+    oi = fetch_oi(ex, sym)
+    cvd = fetch_cvd(ex, sym)
 
     lc, lr = close.iloc[-1], r14.iloc[-1]
     sc = {}
 
     sc['trend'] = 1 if st.iloc[-1] == 1 else -1
-    sc['rsi']   = 1 if lr < 30 else (-1 if lr > 70 else 0)
-    sc['div']   = divergence(close, r14)
+    sc['rsi'] = 1 if lr < 30 else (-1 if lr > 70 else 0)
+    sc['div'] = divergence(close, r14)
 
     if cvd is not None and len(cvd) >= 14:
         pu = lc > close.iloc[-14]
@@ -172,48 +154,43 @@ def scan_coin(ex, sym, bull):
     net = raw * DAMPEN if (not bull and raw > 0) else float(raw)
 
     return {
-        'symbol':  sym,
-        'close':   round(lc, 6),
-        'rsi':     round(lr, 1),
+        'symbol': sym,
+        'close': round(lc, 6),
+        'rsi': round(lr, 1),
         'raw_net': raw,
-        'net':     net,
-        'scores':  sc,
+        'net': net,
+        'scores': sc,
         'funding': round(fund, 2) if fund is not None else None,
-        'oi':      round(oi, 2)   if oi   is not None else None,
+        'oi': round(oi, 2) if oi is not None else None,
     }
 
-# ── Harvest ───────────────────────────────────────────────────────────────────
-
 def harvest_stats(ex, sym, days=30):
-    """Funding rate geçmişinden harvest skoru hesaplar."""
     try:
         history = ex.fetch_funding_rate_history(sym, limit=days * 3)
         if not history:
             return None
         arr = [float(h['fundingRate']) * 100 * 3 * 365 for h in history]
-        a   = np.array(arr)
-        pp  = float((a > 0).mean() * 100)
+        a = np.array(arr)
+        pp = float((a > 0).mean() * 100)
         return {
-            'symbol':  sym,
-            'mean':    round(float(a.mean()), 1),
-            'std':     round(float(a.std()),  1),
+            'symbol': sym,
+            'mean': round(float(a.mean()), 1),
+            'std': round(float(a.std()), 1),
             'pos_pct': round(pp, 0),
-            'score':   round(pp - a.std() * 0.5, 1),
+            'score': round(pp - a.std() * 0.5, 1),
         }
     except:
         return None
 
-# ── HTML Üretimi ──────────────────────────────────────────────────────────────
-
 def pills(sc):
-    names = {'trend':'Trend','rsi':'RSI','div':'Div',
-             'cvd':'CVD','fund':'Fund','oi':'OI','bb':'BB'}
+    names = {'trend': 'Trend', 'rsi': 'RSI', 'div': 'Div',
+             'cvd': 'CVD', 'fund': 'Fund', 'oi': 'OI', 'bb': 'BB'}
     out = ''
     for k, v in sc.items():
-        lbl   = names.get(k, k)
-        cls   = 'bull' if v > 0 else ('bear' if v < 0 else 'neu')
-        arrow = '▲'    if v > 0 else ('▼'    if v < 0 else '–')
-        out  += f'<span class="p {cls}">{arrow}{lbl}</span>'
+        lbl = names.get(k, k)
+        cls = 'bull' if v > 0 else ('bear' if v < 0 else 'neu')
+        arrow = '▲' if v > 0 else ('▼' if v < 0 else '–')
+        out += f'<span class="p {cls}">{arrow}{lbl}</span>'
     return out
 
 def trows(items):
@@ -223,9 +200,9 @@ def trows(items):
     for r in items:
         nc = 'bull' if r['net'] > 0 else 'bear'
         fn = f"{r['funding']:+.1f}%" if r['funding'] is not None else '-'
-        oi = f"{r['oi']:+.1f}%"      if r['oi']      is not None else '-'
+        oi = f"{r['oi']:+.1f}%" if r['oi'] is not None else '-'
         rows += (
-            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT','')}</b></td>"
+            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT', '')}</b></td>"
             f"<td>{r['close']}</td><td>{r['rsi']}</td>"
             f"<td class='{nc}'><b>{r['raw_net']:+d}</b></td>"
             f"<td class='{nc}'>{r['net']:+.1f}</td>"
@@ -240,7 +217,7 @@ def hrows(items):
     rows = ''
     for r in items:
         rows += (
-            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT','')}</b></td>"
+            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT', '')}</b></td>"
             f"<td class='bull'>{r['mean']:+.1f}%</td>"
             f"<td>{r['std']}%</td><td>{r['pos_pct']:.0f}%</td>"
             f"<td class='bull'><b>{r['score']}</b></td></tr>"
@@ -249,8 +226,8 @@ def hrows(items):
 
 def write_html(sl, ss, rl, rs, hv, regime, ts):
     bull = regime['bull']
-    bp   = f"${regime['price']:,.0f}"   if regime['price']  else 'N/A'
-    ep   = f"${regime['ema200']:,.0f}"  if regime['ema200'] else 'N/A'
+    bp = f"${regime['price']:,.0f}" if regime['price'] else 'N/A'
+    ep = f"${regime['ema200']:,.0f}" if regime['ema200'] else 'N/A'
     rlbl = 'BULL' if bull else 'BEAR'
     rcls = 'bull' if bull else 'bear'
 
@@ -318,11 +295,9 @@ tr:hover td{{background:#1c2128}}
     (OUT / "index.html").write_text(html, encoding='utf-8')
     print("[OK] index.html yazildi")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode',  default='dashboard')
+    ap.add_argument('--mode', default='dashboard')
     ap.add_argument('--limit', type=int, default=100)
     args = ap.parse_args()
 
@@ -334,10 +309,13 @@ def main():
 
     try:
         tickers = ex.fetch_tickers()
+
+        def _vol(t):
+            return t.get('quoteVolume') or t.get('baseVolume') or 0
+
         syms = sorted(
-            [k for k, v in tickers.items()
-             if k.endswith(':USDT') and v.get('quoteVolume', 0)],
-            key=lambda s: tickers[s]['quoteVolume'],
+            [k for k, v in tickers.items() if k.endswith(':USDT')],
+            key=lambda s: _vol(tickers[s]),
             reverse=True
         )[:args.limit]
     except Exception as e:
@@ -359,10 +337,10 @@ def main():
             print(f"ERR:{e}")
         time.sleep(0.15)
 
-    sl = sorted([r for r in results if r['net']     >= STRONG],  key=lambda x: -x['net'])
-    ss = sorted([r for r in results if r['net']     <= -STRONG], key=lambda x:  x['net'])
-    rl = sorted([r for r in results if r['raw_net'] >= STRONG],  key=lambda x: -x['raw_net'])
-    rs = sorted([r for r in results if r['raw_net'] <= -STRONG], key=lambda x:  x['raw_net'])
+    sl = sorted([r for r in results if r['net'] >= STRONG], key=lambda x: -x['net'])
+    ss = sorted([r for r in results if r['net'] <= -STRONG], key=lambda x: x['net'])
+    rl = sorted([r for r in results if r['raw_net'] >= STRONG], key=lambda x: -x['raw_net'])
+    rs = sorted([r for r in results if r['raw_net'] <= -STRONG], key=lambda x: x['raw_net'])
 
     print("Harvest taranıyor...")
     hv = []
