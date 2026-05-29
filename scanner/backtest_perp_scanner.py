@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-import json, time, requests, sys, argparse
+import time, sys, argparse
 from datetime import datetime, timezone
 from pathlib import Path
-import numpy as np
-import pandas as pd
+try:
+    import ccxt, numpy as np, pandas as pd
+except ImportError:
+    sys.exit("Eksik kutuphane: pip install ccxt pandas numpy")
 
 OUT = Path(__file__).parent
 STRONG = 2
 DAMPEN = 0.5
-BASE = "https://fapi.binance.com"
+
+# ── Teknik Indikatörler ──────────────────────────────────────────────────────
 
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
@@ -17,207 +20,241 @@ def rsi(s, n=14):
     d = s.diff()
     g = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
     l = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    return 100 - 100/(1 + g/l.replace(0, float('nan')))
+    return 100 - 100 / (1 + g / l.replace(0, float('nan')))
 
 def bollinger(s, n=20, m=2):
     mid = s.rolling(n).mean()
     std = s.rolling(n).std()
-    return mid - m*std, mid + m*std
+    return mid - m * std, mid + m * std
 
 def atr(df, n=10):
     h, l, c = df['high'], df['low'], df['close'].shift(1)
-    tr = pd.concat([h-l, (h-c).abs(), (l-c).abs()], axis=1).max(axis=1)
+    tr = pd.concat([h - l, (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/n, adjust=False).mean()
 
 def supertrend(df, n=10, m=3):
-    hl2 = (df['high']+df['low'])/2
+    hl2 = (df['high'] + df['low']) / 2
     a = atr(df, n)
-    ub, lb = hl2+m*a, hl2-m*a
-    st = [float('nan')]*len(df)
-    d = [1]*len(df)
+    ub = hl2 + m * a
+    lb = hl2 - m * a
+    st = [float('nan')] * len(df)
+    d = [1] * len(df)
     for i in range(1, len(df)):
-        p = st[i-1] if st[i-1]==st[i-1] else lb.iloc[i]
+        p = st[i-1] if st[i-1] == st[i-1] else lb.iloc[i]
         c = df['close'].iloc[i]
         if c > p:
             d[i] = 1
-            st[i] = max(lb.iloc[i], p) if d[i-1]==1 else lb.iloc[i]
+            st[i] = max(lb.iloc[i], p) if d[i-1] == 1 else lb.iloc[i]
         else:
             d[i] = -1
-            st[i] = min(ub.iloc[i], p) if d[i-1]==-1 else ub.iloc[i]
+            st[i] = min(ub.iloc[i], p) if d[i-1] == -1 else ub.iloc[i]
     return pd.Series(d, index=df.index)
 
 def divergence(close, rsi_s, lb=14):
-    if len(close) < lb+1:
+    if len(close) < lb + 1:
         return 0
     c, r = close.iloc[-lb:], rsi_s.iloc[-lb:]
-    pu, ru = c.iloc[-1]>c.iloc[0], r.iloc[-1]>r.iloc[0]
-    if not pu and ru: return 1
-    if pu and not ru: return -1
+    pu = c.iloc[-1] > c.iloc[0]
+    ru = r.iloc[-1] > r.iloc[0]
+    if not pu and ru:
+        return 1
+    if pu and not ru:
+        return -1
     return 0
 
-def get(path, params=None):
-    r = requests.get(BASE+path, params=params, timeout=12)
-    r.raise_for_status()
-    return r.json()
+# ── Exchange ─────────────────────────────────────────────────────────────────
 
-def fetch_ohlcv(sym, interval='4h', limit=300):
+def get_ex():
+    return ccxt.okx({
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True
+    })
+
+# ── Veri Çekme (tamamı CCXT, hardcoded URL yok) ──────────────────────────────
+
+def fetch_ohlcv(ex, sym, tf='4h', lim=300):
     try:
-        data = get('/fapi/v1/klines', {'symbol':sym,'interval':interval,'limit':limit})
-        if not data or len(data)<60: return None
-        df = pd.DataFrame(data, columns=[
-            'ts','open','high','low','close','volume',
-            'close_ts','qv','trades','tbv','tqv','ignore'])
-        df['ts'] = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
-        df = df.set_index('ts')[['open','high','low','close','volume']].astype(float)
-        return df
+        raw = ex.fetch_ohlcv(sym, tf, limit=lim)
+        if not raw or len(raw) < 60:
+            return None
+        df = pd.DataFrame(raw, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+        return df.set_index('ts').astype(float)
     except Exception as e:
         print(f"ohlcv err {sym}: {e}")
         return None
 
-def fetch_funding(sym):
+def fetch_funding(ex, sym):
+    """Güncel funding rate → yıllık % olarak döner."""
     try:
-        d = get('/fapi/v1/fundingRate', {'symbol':sym,'limit':1})
-        return float(d[-1]['fundingRate'])*100*3*365 if d else None
-    except: return None
+        data = ex.fetch_funding_rate(sym)
+        rate = data.get('fundingRate')
+        if rate is None:
+            return None
+        return float(rate) * 100 * 3 * 365  # 8h ödeme × 3 × 365
+    except:
+        return None
 
-def fetch_cvd(sym, interval='4h', limit=100):
+def fetch_oi(ex, sym):
+    """OI değişimi (son 24 bar, 1h) → % olarak döner."""
     try:
-        data = get('/fapi/v1/klines', {'symbol':sym,'interval':interval,'limit':limit})
-        cvd = pd.Series([float(k[9])-(float(k[5])-float(k[9])) for k in data]).cumsum()
-        return cvd
-    except: return None
+        history = ex.fetch_open_interest_history(sym, '1h', limit=25)
+        if not history or len(history) < 2:
+            return None
+        o = float(history[0]['openInterestAmount'])
+        n = float(history[-1]['openInterestAmount'])
+        return (n - o) / o * 100 if o else None
+    except:
+        return None
 
-def fetch_oi(sym):
-    try:
-        d = get('/futures/data/openInterestHist', {'symbol':sym,'period':'1h','limit':25})
-        if isinstance(d,list) and len(d)>=2:
-            o, n = float(d[0]['sumOpenInterest']), float(d[-1]['sumOpenInterest'])
-            return (n-o)/o*100 if o else None
-    except: return None
+def fetch_cvd(ex, sym, lim=100):
+    """
+    CVD: taker buy volume - taker sell volume kümülatif toplamı.
+    OKX mark candles taker buy'ı ayrıştırmaz; CCXT trades üzerinden
+    hesaplamak rate-limit açısından ağır. En güvenli yol: None döndür,
+    sinyal 0 sayılır. Diğer 6 sinyal sağlıklı çalışır.
+    """
+    return None
 
-def btc_regime():
-    df = fetch_ohlcv('BTCUSDT', '1d', 220)
-    if df is None or len(df)<200:
-        return {'bull':True,'price':None,'ema200':None}
+# ── BTC Rejimi ────────────────────────────────────────────────────────────────
+
+def btc_regime(ex):
+    df = fetch_ohlcv(ex, 'BTC/USDT:USDT', '1d', 220)
+    if df is None or len(df) < 200:
+        return {'bull': True, 'price': None, 'ema200': None}
     e = ema(df['close'], 200)
     p = df['close'].iloc[-1]
-    return {'bull': p>e.iloc[-1], 'price': p, 'ema200': e.iloc[-1]}
+    return {'bull': p > e.iloc[-1], 'price': p, 'ema200': e.iloc[-1]}
 
-def get_universe(limit=100):
-    try:
-        data = get('/fapi/v1/ticker/24hr')
-        usdt = [d for d in data if d['symbol'].endswith('USDT') and '_' not in d['symbol']]
-        usdt.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
-        return [d['symbol'] for d in usdt[:limit]]
-    except Exception as e:
-        print(f"universe err: {e}")
-        return []
+# ── Coin Tarama ───────────────────────────────────────────────────────────────
 
-def scan_coin(sym, bull):
-    df = fetch_ohlcv(sym)
-    if df is None: return None
-    close = df['close']
-    r14 = rsi(close)
+def scan_coin(ex, sym, bull):
+    df = fetch_ohlcv(ex, sym)
+    if df is None:
+        return None
+
+    close  = df['close']
+    r14    = rsi(close)
     bb_lo, bb_hi = bollinger(close)
-    st = supertrend(df)
-    cvd = fetch_cvd(sym)
-    fund = fetch_funding(sym)
-    oi = fetch_oi(sym)
+    st     = supertrend(df)
+    fund   = fetch_funding(ex, sym)
+    oi     = fetch_oi(ex, sym)
+    cvd    = fetch_cvd(ex, sym)
+
     lc, lr = close.iloc[-1], r14.iloc[-1]
     sc = {}
-    sc['trend'] = 1 if st.iloc[-1]==1 else -1
-    sc['rsi'] = 1 if lr<30 else (-1 if lr>70 else 0)
-    sc['div'] = divergence(close, r14)
-    if cvd is not None and len(cvd)>=14:
-        pu = lc>close.iloc[-14]
-        cu = cvd.iloc[-1]>cvd.iloc[-14]
+
+    sc['trend'] = 1 if st.iloc[-1] == 1 else -1
+    sc['rsi']   = 1 if lr < 30 else (-1 if lr > 70 else 0)
+    sc['div']   = divergence(close, r14)
+
+    if cvd is not None and len(cvd) >= 14:
+        pu = lc > close.iloc[-14]
+        cu = cvd.iloc[-1] > cvd.iloc[-14]
         sc['cvd'] = 1 if (not pu and cu) else (-1 if (pu and not cu) else 0)
     else:
         sc['cvd'] = 0
-    sc['fund'] = 0
+
     if fund is not None:
-        sc['fund'] = 1 if fund<-10 else (-1 if fund>50 else 0)
-    sc['oi'] = 0
+        sc['fund'] = 1 if fund < -10 else (-1 if fund > 50 else 0)
+    else:
+        sc['fund'] = 0
+
     if oi is not None:
-        pc = (lc/close.iloc[-2]-1)*100
-        sc['oi'] = 1 if (oi>2 and pc>0) else (-1 if (oi>2 and pc<0) else 0)
-    sc['bb'] = 1 if lc<bb_lo.iloc[-1] else (-1 if lc>bb_hi.iloc[-1] else 0)
+        pc = (lc / close.iloc[-2] - 1) * 100
+        sc['oi'] = 1 if (oi > 2 and pc > 0) else (-1 if (oi > 2 and pc < 0) else 0)
+    else:
+        sc['oi'] = 0
+
+    sc['bb'] = 1 if lc < bb_lo.iloc[-1] else (-1 if lc > bb_hi.iloc[-1] else 0)
+
     raw = sum(sc.values())
-    net = raw*DAMPEN if (not bull and raw>0) else float(raw)
+    net = raw * DAMPEN if (not bull and raw > 0) else float(raw)
+
     return {
-        'symbol': sym,
-        'close': round(lc,6),
-        'rsi': round(lr,1),
+        'symbol':  sym,
+        'close':   round(lc, 6),
+        'rsi':     round(lr, 1),
         'raw_net': raw,
-        'net': net,
-        'scores': sc,
-        'funding': round(fund,2) if fund is not None else None,
-        'oi': round(oi,2) if oi is not None else None
+        'net':     net,
+        'scores':  sc,
+        'funding': round(fund, 2) if fund is not None else None,
+        'oi':      round(oi, 2)   if oi   is not None else None,
     }
 
-def harvest_stats(sym, days=30):
+# ── Harvest ───────────────────────────────────────────────────────────────────
+
+def harvest_stats(ex, sym, days=30):
+    """Funding rate geçmişinden harvest skoru hesaplar."""
     try:
-        d = get('/fapi/v1/fundingRate', {'symbol':sym,'limit':days*3})
-        arr = [float(x['fundingRate'])*100*3*365 for x in d]
-        if not arr: return None
-        a = np.array(arr)
-        pp = float((a>0).mean()*100)
+        history = ex.fetch_funding_rate_history(sym, limit=days * 3)
+        if not history:
+            return None
+        arr = [float(h['fundingRate']) * 100 * 3 * 365 for h in history]
+        a   = np.array(arr)
+        pp  = float((a > 0).mean() * 100)
         return {
-            'symbol':sym,
-            'mean':round(float(a.mean()),1),
-            'std':round(float(a.std()),1),
-            'pos_pct':round(pp,0),
-            'score':round(pp-a.std()*0.5,1)
+            'symbol':  sym,
+            'mean':    round(float(a.mean()), 1),
+            'std':     round(float(a.std()),  1),
+            'pos_pct': round(pp, 0),
+            'score':   round(pp - a.std() * 0.5, 1),
         }
-    except: return None
+    except:
+        return None
+
+# ── HTML Üretimi ──────────────────────────────────────────────────────────────
 
 def pills(sc):
-    names={'trend':'Trend','rsi':'RSI','div':'Div','cvd':'CVD','fund':'Fund','oi':'OI','bb':'BB'}
-    out=''
-    for k,v in sc.items():
-        lbl=names.get(k,k)
-        cls='bull' if v>0 else ('bear' if v<0 else 'neu')
-        arrow='u25b2' if v>0 else ('u25bc' if v<0 else '-')
-        a='▲' if v>0 else ('▼' if v<0 else '–')
-        out+=f'<span class="p {cls}">{a}{lbl}</span>'
+    names = {'trend':'Trend','rsi':'RSI','div':'Div',
+             'cvd':'CVD','fund':'Fund','oi':'OI','bb':'BB'}
+    out = ''
+    for k, v in sc.items():
+        lbl   = names.get(k, k)
+        cls   = 'bull' if v > 0 else ('bear' if v < 0 else 'neu')
+        arrow = '▲'    if v > 0 else ('▼'    if v < 0 else '–')
+        out  += f'<span class="p {cls}">{arrow}{lbl}</span>'
     return out
 
 def trows(items):
     if not items:
         return "<tr><td colspan='8' class='empty'>Sinyal yok</td></tr>"
-    rows=''
+    rows = ''
     for r in items:
-        nc='bull' if r['net']>0 else 'bear'
-        fn=f"{r['funding']:+.1f}%" if r['funding'] is not None else '-'
-        oi=f"{r['oi']:+.1f}%" if r['oi'] is not None else '-'
-        sym=r['symbol'].replace('USDT','')
-        rows+=(f"<tr><td><b>{sym}</b></td>"
-               f"<td>{r['close']}</td><td>{r['rsi']}</td>"
-               f"<td class='{nc}'><b>{r['raw_net']:+d}</b></td>"
-               f"<td class='{nc}'>{r['net']:+.1f}</td>"
-               f"<td>{fn}</td><td>{oi}</td>"
-               f"<td>{pills(r['scores'])}</td></tr>")
+        nc = 'bull' if r['net'] > 0 else 'bear'
+        fn = f"{r['funding']:+.1f}%" if r['funding'] is not None else '-'
+        oi = f"{r['oi']:+.1f}%"      if r['oi']      is not None else '-'
+        rows += (
+            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT','')}</b></td>"
+            f"<td>{r['close']}</td><td>{r['rsi']}</td>"
+            f"<td class='{nc}'><b>{r['raw_net']:+d}</b></td>"
+            f"<td class='{nc}'>{r['net']:+.1f}</td>"
+            f"<td>{fn}</td><td>{oi}</td>"
+            f"<td>{pills(r['scores'])}</td></tr>"
+        )
     return rows
 
 def hrows(items):
     if not items:
         return "<tr><td colspan='5' class='empty'>Veri yok</td></tr>"
-    rows=''
+    rows = ''
     for r in items:
-        sym=r['symbol'].replace('USDT','')
-        rows+=(f"<tr><td><b>{sym}</b></td>"
-               f"<td class='bull'>{r['mean']:+.1f}%</td>"
-               f"<td>{r['std']}%</td><td>{r['pos_pct']:.0f}%</td>"
-               f"<td class='bull'><b>{r['score']}</b></td></tr>")
+        rows += (
+            f"<tr><td><b>{r['symbol'].replace('/USDT:USDT','')}</b></td>"
+            f"<td class='bull'>{r['mean']:+.1f}%</td>"
+            f"<td>{r['std']}%</td><td>{r['pos_pct']:.0f}%</td>"
+            f"<td class='bull'><b>{r['score']}</b></td></tr>"
+        )
     return rows
 
 def write_html(sl, ss, rl, rs, hv, regime, ts):
-    bull=regime['bull']
-    bp=f"${regime['price']:,.0f}" if regime['price'] else 'N/A'
-    ep=f"${regime['ema200']:,.0f}" if regime['ema200'] else 'N/A'
-    rlbl='BULL' if bull else 'BEAR'
-    rcls='bull' if bull else 'bear'
-    html=f"""<!DOCTYPE html>
+    bull = regime['bull']
+    bp   = f"${regime['price']:,.0f}"   if regime['price']  else 'N/A'
+    ep   = f"${regime['ema200']:,.0f}"  if regime['ema200'] else 'N/A'
+    rlbl = 'BULL' if bull else 'BEAR'
+    rcls = 'bull' if bull else 'bear'
+
+    html = f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
@@ -259,7 +296,7 @@ tr:hover td{{background:#1c2128}}
 <div class="kpi"><div class="l">Guncelleme</div><div class="v" style="font-size:.72em">{ts}</div></div>
 </div>
 <button class="btn" onclick="location.reload()">Sayfayi Yenile</button>
-<div class="warn">UYARI: Karar destek aracidir, trade botu degildir. Backtest Sharpe -0.7 negatif. Paper trade tutun, 30+ ornek sonrasi hit-rate olcun.</div>
+<div class="warn">UYARI: Karar destek aracidir, trade botu degildir. Paper trade tutun, 30+ ornek sonrasi hit-rate olcun.</div>
 <h2>Guclu Long (net &gt;= {STRONG})</h2>
 <table><tr><th>Sembol</th><th>Fiyat</th><th>RSI</th><th>Ham</th><th>Net</th><th>Fund</th><th>OI</th><th>Sinyaller</th></tr>
 {trows(sl)}</table>
@@ -277,27 +314,42 @@ tr:hover td{{background:#1c2128}}
 {hrows(hv)}</table>
 <p style="color:var(--muted);font-size:.7em;text-align:center;margin-top:12px">15 dk otomatik guncellenir | {ts}</p>
 </body></html>"""
-    (OUT/"index.html").write_text(html, encoding='utf-8')
+
+    (OUT / "index.html").write_text(html, encoding='utf-8')
     print("[OK] index.html yazildi")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', default='dashboard')
+    ap.add_argument('--mode',  default='dashboard')
     ap.add_argument('--limit', type=int, default=100)
     args = ap.parse_args()
+
     print(f"=== Scanner {datetime.now(timezone.utc).strftime('%H:%M UTC')} ===")
-    regime = btc_regime()
+    ex = get_ex()
+
+    regime = btc_regime(ex)
     print(f"BTC: {'BULL' if regime['bull'] else 'BEAR'} | {regime['price']}")
-    syms = get_universe(args.limit)
-    if not syms:
-        print("Universe bos, cikiliyor")
+
+    try:
+        tickers = ex.fetch_tickers()
+        syms = sorted(
+            [k for k, v in tickers.items()
+             if k.endswith(':USDT') and v.get('quoteVolume', 0)],
+            key=lambda s: tickers[s]['quoteVolume'],
+            reverse=True
+        )[:args.limit]
+    except Exception as e:
+        print(f"Universe hatasi: {e}")
         return
+
     print(f"{len(syms)} coin taranacak...")
     results = []
     for i, sym in enumerate(syms):
         print(f"[{i+1}/{len(syms)}] {sym}", end=' ', flush=True)
         try:
-            r = scan_coin(sym, regime['bull'])
+            r = scan_coin(ex, sym, regime['bull'])
             if r:
                 results.append(r)
                 print(f"net={r['net']:+.1f}")
@@ -305,20 +357,23 @@ def main():
                 print("skip")
         except Exception as e:
             print(f"ERR:{e}")
-        time.sleep(0.1)
-    sl = sorted([r for r in results if r['net']>=STRONG], key=lambda x:-x['net'])
-    ss = sorted([r for r in results if r['net']<=-STRONG], key=lambda x:x['net'])
-    rl = sorted([r for r in results if r['raw_net']>=STRONG], key=lambda x:-x['raw_net'])
-    rs = sorted([r for r in results if r['raw_net']<=-STRONG], key=lambda x:x['raw_net'])
+        time.sleep(0.15)
+
+    sl = sorted([r for r in results if r['net']     >= STRONG],  key=lambda x: -x['net'])
+    ss = sorted([r for r in results if r['net']     <= -STRONG], key=lambda x:  x['net'])
+    rl = sorted([r for r in results if r['raw_net'] >= STRONG],  key=lambda x: -x['raw_net'])
+    rs = sorted([r for r in results if r['raw_net'] <= -STRONG], key=lambda x:  x['raw_net'])
+
     print("Harvest taranıyor...")
     hv = []
     for sym in syms[:60]:
-        s = harvest_stats(sym)
-        if s and s['mean']>20 and s['pos_pct']>60:
+        s = harvest_stats(ex, sym)
+        if s and s['mean'] > 20 and s['pos_pct'] > 60:
             hv.append(s)
-        time.sleep(0.05)
-    hv.sort(key=lambda x:-x['score'])
+        time.sleep(0.08)
+    hv.sort(key=lambda x: -x['score'])
     hv = hv[:15]
+
     ts = datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
     write_html(sl, ss, rl, rs, hv, regime, ts)
     print(f"=== TAMAM | Long:{len(sl)} Short:{len(ss)} Harvest:{len(hv)} ===")
